@@ -1,0 +1,7 @@
+{
+  "title": "FK PDF-viser",
+  "description": "Viser PDF-vedlegg som er innebygd som Base64 i egenskapssettet FK_Vedlegg.",
+  "icon": "https://mikalmuff.github.io/tc-pdf-viser/icon.png",
+  "url": "https://mikalmuff.github.io/tc-pdf-viser/index.html",
+  "enabled": true
+}

@@ -1,0 +1,226 @@
+<!DOCTYPE html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>FK PDF-viser</title>
+<script src="https://components.connect.trimble.com/trimble-connect-workspace-api/index.js"></script>
+<style>
+  :root { --ok:#1a7f37; --feil:#cf222e; --grå:#6e7781; --kant:#d0d7de; }
+  * { box-sizing: border-box; }
+  html, body { margin:0; height:100%; font: 13px/1.4 "Segoe UI", system-ui, sans-serif; color:#1f2328; }
+  body { display:flex; flex-direction:column; }
+  header { padding:8px 10px; border-bottom:1px solid var(--kant); }
+  h1 { font-size:14px; margin:0 0 4px; }
+  #status { color:var(--grå); }
+  #info { padding:6px 10px; border-bottom:1px solid var(--kant); display:none; }
+  #info table { border-collapse:collapse; width:100%; }
+  #info td { padding:1px 4px; vertical-align:top; word-break:break-all; }
+  #info td:first-child { color:var(--grå); white-space:nowrap; width:1%; }
+  .ok { color:var(--ok); font-weight:600; } .feil { color:var(--feil); font-weight:600; }
+  .knapper { margin-top:6px; display:flex; gap:6px; flex-wrap:wrap; }
+  button { font:inherit; padding:4px 10px; border:1px solid var(--kant); border-radius:4px; background:#f6f8fa; cursor:pointer; }
+  button:hover { background:#eaeef2; }
+  #visning { flex:1; min-height:0; position:relative; }
+  #visning iframe { width:100%; height:100%; border:0; }
+  #tom { padding:20px 10px; color:var(--grå); }
+  #debug { display:none; padding:6px 10px; border-top:1px solid var(--kant); max-height:35%; overflow:auto; font-family:Consolas, monospace; font-size:11px; white-space:pre-wrap; }
+</style>
+</head>
+<body>
+<header>
+  <h1>FK PDF-viser</h1>
+  <div id="status">Kobler til Trimble Connect …</div>
+</header>
+<div id="info">
+  <table id="infotabell"></table>
+  <div class="knapper">
+    <button id="nyFane">Åpne i ny fane</button>
+    <button id="lastNed">Last ned</button>
+    <button id="visDebug">Vis egenskaper (feilsøking)</button>
+  </div>
+</div>
+<div id="visning"><div id="tom">Velg et objekt i modellen som har et innebygd PDF-vedlegg.</div></div>
+<div id="debug"></div>
+
+<script>
+/* ---------- Innstillinger ---------- */
+const PSET_NAVN = "FK_Vedlegg";   // egenskapssettet PDF-en ligger i
+const PROP_INNHOLD = "Innhold";   // egenskapen med Base64-strengen
+const PDF_SIGNATUR = "JVBERi0";   // "%PDF-" kodet i Base64, brukes som reserve-søk
+
+/* ---------- Tilstand ---------- */
+let API = null;
+let gjeldendeUrl = null, gjeldendeFilnavn = "vedlegg.pdf", gjeldendeNokkel = null;
+let sisteEgenskaper = null;
+const $ = id => document.getElementById(id);
+
+function settStatus(tekst, klasse) {
+  $("status").textContent = tekst;
+  $("status").className = klasse || "";
+}
+
+/* ---------- Tilkobling ---------- */
+(async function start() {
+  try {
+    API = await TrimbleConnectWorkspace.connect(window.parent, onEvent, 30000);
+    settStatus("Tilkoblet. Velg et objekt i modellen.");
+    await behandleUtvalg();          // hvis noe allerede er valgt
+  } catch (e) {
+    settStatus("Fikk ikke kontakt med Trimble Connect. Siden må åpnes som utvidelse i 3D-viseren.", "feil");
+    console.error(e);
+  }
+})();
+
+function onEvent(event, data) {
+  if (event === "viewer.onSelectionChanged") behandleUtvalg();
+}
+
+/* ---------- Utvalg og egenskaper ---------- */
+let utvalgTeller = 0;
+async function behandleUtvalg() {
+  const minTur = ++utvalgTeller;    // ignorer svar fra eldre klikk
+  let utvalg;
+  try { utvalg = await API.viewer.getSelection(); } catch (e) { console.error(e); return; }
+  if (minTur !== utvalgTeller) return;
+
+  const grupper = (utvalg || []).filter(g => g.objectRuntimeIds && g.objectRuntimeIds.length);
+  if (!grupper.length) { sisteEgenskaper = null; nullstill("Ingen objekter valgt."); return; }
+
+  settStatus("Leser egenskaper …");
+  const alle = [];
+  for (const g of grupper) {
+    try {
+      const props = await API.viewer.getObjectProperties(g.modelId, g.objectRuntimeIds.slice(0, 20));
+      alle.push(...(props || []));
+    } catch (e) { console.error(e); }
+  }
+  if (minTur !== utvalgTeller) return;
+  sisteEgenskaper = alle;
+  oppdaterDebug();
+
+  const funn = finnPdf(alle);
+  if (!funn) { nullstill("Valgt objekt har ikke " + PSET_NAVN + "." + PROP_INNHOLD + "."); return; }
+  await visPdf(funn);
+}
+
+function finnPdf(objekter) {
+  let reserve = null;
+  for (const obj of objekter) {
+    for (const pset of (obj.properties || [])) {
+      const props = pset.properties || [];
+      const verdi = navn => { const p = props.find(p => p.name === navn); return p ? p.value : undefined; };
+      if (pset.name === PSET_NAVN && verdi(PROP_INNHOLD) !== undefined) {
+        return {
+          base64: String(verdi(PROP_INNHOLD)),
+          filnavn: verdi("Filnavn"),
+          sha256: verdi("SHA256"),
+          storrelse: verdi("Filstorrelse_byte"),
+          kilde: PSET_NAVN + "." + PROP_INNHOLD,
+          objekt: obj.product ? obj.product.name : obj.id
+        };
+      }
+      // Reserve: hvilken som helst egenskap som ser ut som en Base64-PDF
+      for (const p of props) {
+        if (!reserve && typeof p.value === "string" && p.value.startsWith(PDF_SIGNATUR)) {
+          reserve = { base64: p.value, kilde: pset.name + "." + p.name, objekt: obj.id };
+        }
+      }
+    }
+  }
+  return reserve;
+}
+
+/* ---------- Dekoding og visning ---------- */
+async function visPdf(funn) {
+  const ren = funn.base64.replace(/\s+/g, "");
+  const nokkel = ren.length + ":" + ren.slice(-40);
+  if (nokkel === gjeldendeNokkel) { settStatus("Viser PDF.", "ok"); return; }   // samme fil som før
+
+  const rader = [
+    ["Objekt", funn.objekt ?? "–"],
+    ["Kilde", funn.kilde],
+    ["Filnavn", funn.filnavn ?? "–"],
+    ["Lengde Base64", ren.length.toLocaleString("no") + " tegn"]
+  ];
+
+  let bytes;
+  try {
+    const bin = atob(ren);
+    bytes = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
+  } catch (e) {
+    rader.push(["Dekoding", '<span class="feil">Feilet – strengen er ugyldig eller avkuttet</span>']);
+    visInfo(rader); visTom("Kunne ikke dekode Base64-strengen."); settStatus("Dekoding feilet.", "feil");
+    gjeldendeNokkel = null; return;
+  }
+
+  rader.push(["Dekodet størrelse", bytes.length.toLocaleString("no") + " byte" +
+    (funn.storrelse ? (Number(funn.storrelse) === bytes.length
+      ? ' <span class="ok">✓ stemmer</span>'
+      : ' <span class="feil">✗ forventet ' + Number(funn.storrelse).toLocaleString("no") + '</span>') : "")]);
+
+  if (funn.sha256 && crypto.subtle) {
+    const hash = Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)))
+      .map(b => b.toString(16).padStart(2, "0")).join("");
+    rader.push(["SHA-256", hash === String(funn.sha256).toLowerCase()
+      ? '<span class="ok">✓ identisk med originalen</span>'
+      : '<span class="feil">✗ avviker – filen er endret eller avkuttet</span>']);
+  }
+  const erPdf = bytes.length > 4 && String.fromCharCode(...bytes.slice(0, 5)) === "%PDF-";
+  if (!erPdf) rader.push(["Format", '<span class="feil">Innholdet starter ikke med %PDF-</span>']);
+
+  if (gjeldendeUrl) URL.revokeObjectURL(gjeldendeUrl);
+  gjeldendeUrl = URL.createObjectURL(new Blob([bytes], { type: "application/pdf" }));
+  gjeldendeFilnavn = funn.filnavn || "vedlegg.pdf";
+  gjeldendeNokkel = nokkel;
+
+  visInfo(rader);
+  $("visning").innerHTML = "";
+  const ramme = document.createElement("iframe");
+  ramme.src = gjeldendeUrl;
+  ramme.title = gjeldendeFilnavn;
+  $("visning").appendChild(ramme);
+  settStatus("Viser PDF.", "ok");
+}
+
+function visInfo(rader) {
+  $("infotabell").innerHTML = rader.map(([k, v]) => `<tr><td>${k}</td><td>${v}</td></tr>`).join("");
+  $("info").style.display = "block";
+}
+function visTom(tekst) { $("visning").innerHTML = `<div id="tom">${tekst}</div>`; }
+function nullstill(tekst) {
+  settStatus(tekst); visTom("Velg et objekt i modellen som har et innebygd PDF-vedlegg.");
+  $("info").style.display = sisteEgenskaper && sisteEgenskaper.length ? "block" : "none";
+  $("infotabell").innerHTML = ""; gjeldendeNokkel = null;
+}
+
+/* ---------- Knapper ---------- */
+$("nyFane").onclick = () => { if (gjeldendeUrl) window.open(gjeldendeUrl, "_blank"); };
+$("lastNed").onclick = () => {
+  if (!gjeldendeUrl) return;
+  const a = document.createElement("a");
+  a.href = gjeldendeUrl; a.download = gjeldendeFilnavn; document.body.appendChild(a); a.click(); a.remove();
+};
+$("visDebug").onclick = () => {
+  const d = $("debug"); d.style.display = d.style.display === "block" ? "none" : "block"; oppdaterDebug();
+};
+function oppdaterDebug() {
+  if ($("debug").style.display !== "block" || !sisteEgenskaper) return;
+  // Viser psett og egenskaper; lange verdier forkortes, men lengden vises
+  const kort = sisteEgenskaper.map(o => ({
+    id: o.id, class: o.class, product: o.product,
+    properties: (o.properties || []).map(ps => ({
+      name: ps.name,
+      properties: (ps.properties || []).map(p => ({
+        name: p.name, type: p.type,
+        value: typeof p.value === "string" && p.value.length > 120
+          ? p.value.slice(0, 60) + " … [" + p.value.length + " tegn]" : p.value
+      }))
+    }))
+  }));
+  $("debug").textContent = JSON.stringify(kort, null, 2);
+}
+</script>
+</body>
+</html>
